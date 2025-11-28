@@ -1,10 +1,11 @@
 import { SceneContext, ParsedSegment } from "../types";
 
 let audioCtx: AudioContext | null = null;
+const SAMPLE_RATE = 24000;
 
 export const getAudioContext = () => {
   if (!audioCtx) {
-    audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+    audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: SAMPLE_RATE });
   }
   return audioCtx;
 };
@@ -21,11 +22,9 @@ export const base64ToArrayBuffer = (base64: string): ArrayBuffer => {
 
 export const decodeAudioData = async (arrayBuffer: ArrayBuffer): Promise<AudioBuffer> => {
   const ctx = getAudioContext();
-  const sampleRate = 24000;
-  const numChannels = 1;
-
+  
   if (arrayBuffer.byteLength === 0) {
-     return ctx.createBuffer(1, 100, sampleRate); // Return tiny silence
+     return ctx.createBuffer(1, 100, SAMPLE_RATE); // Return tiny silence
   }
 
   // Gemini TTS returns Raw PCM 16-bit, 24kHz, Mono, Little Endian.
@@ -33,7 +32,7 @@ export const decodeAudioData = async (arrayBuffer: ArrayBuffer): Promise<AudioBu
   // Ensure we have complete 2-byte samples
   const numSamples = Math.floor(arrayBuffer.byteLength / 2);
   
-  const audioBuffer = ctx.createBuffer(numChannels, numSamples, sampleRate);
+  const audioBuffer = ctx.createBuffer(1, numSamples, SAMPLE_RATE);
   const channelData = audioBuffer.getChannelData(0);
 
   for (let i = 0; i < numSamples; i++) {
@@ -48,7 +47,7 @@ export const decodeAudioData = async (arrayBuffer: ArrayBuffer): Promise<AudioBu
 export const createSilenceBuffer = (duration: number): AudioBuffer => {
   const ctx = getAudioContext();
   const safeDuration = Math.max(0.1, duration); 
-  return ctx.createBuffer(1, Math.floor(24000 * safeDuration), 24000);
+  return ctx.createBuffer(1, Math.floor(SAMPLE_RATE * safeDuration), SAMPLE_RATE);
 };
 
 export const trimSilence = (buffer: AudioBuffer): AudioBuffer => {
@@ -77,7 +76,14 @@ export const trimSilence = (buffer: AudioBuffer): AudioBuffer => {
 
 // --- Reverb Generation ---
 
-const createImpulseResponse = (ctx: BaseAudioContext, duration: number, decay: number) => {
+let cachedImpulse: AudioBuffer | null = null;
+
+const getImpulseResponse = (ctx: BaseAudioContext, duration: number, decay: number) => {
+  // Optimization: Return cached buffer if available. 
+  // Note: AudioBuffers can be shared across contexts if created by the main context, 
+  // but OfflineAudioContext is strict. However, the data generation is the expensive part.
+  if (cachedImpulse) return cachedImpulse;
+
   const length = ctx.sampleRate * duration;
   const impulse = ctx.createBuffer(2, length, ctx.sampleRate);
   const left = impulse.getChannelData(0);
@@ -90,6 +96,8 @@ const createImpulseResponse = (ctx: BaseAudioContext, duration: number, decay: n
     left[i] = val;
     right[i] = val;
   }
+  
+  cachedImpulse = impulse;
   return impulse;
 };
 
@@ -100,8 +108,8 @@ export const applyReverb = async (inputBuffer: AudioBuffer, mix: number = 0.3): 
   source.buffer = inputBuffer;
 
   const convolver = ctx.createConvolver();
-  // Short, tight room reverb for dialogue
-  convolver.buffer = createImpulseResponse(ctx, 1.5, 3.0); 
+  // Short, tight room reverb for dialogue. Reuses cached impulse if available.
+  convolver.buffer = getImpulseResponse(ctx, 1.5, 3.0); 
 
   const dryGain = ctx.createGain();
   const wetGain = ctx.createGain();
@@ -142,7 +150,7 @@ export const generateAmbience = async (
   duration: number, 
   type: SceneContext['roomToneType'] | SceneContext['bgNoiseType']
 ): Promise<AudioBuffer> => {
-  const sampleRate = 24000;
+  const sampleRate = SAMPLE_RATE;
   // Min duration 1s to avoid errors
   const safeDuration = Math.max(1, duration);
   const ctx = new OfflineAudioContext(2, Math.floor(sampleRate * safeDuration), sampleRate);
@@ -205,7 +213,7 @@ export const generateAmbience = async (
 const random = (min: number, max: number) => Math.random() * (max - min) + min;
 
 export const generateSFX = async (type: string): Promise<AudioBuffer> => {
-   const sampleRate = 24000;
+   const sampleRate = SAMPLE_RATE;
    // Use a generous 4s buffer for SFX to allow for tails and multi-step sounds
    const ctx = new OfflineAudioContext(2, sampleRate * 4, sampleRate);
    const t = type.toLowerCase();
@@ -476,7 +484,7 @@ const SCALES = {
 };
 
 export const generateAdvancedScore = async (duration: number, style: SceneContext['scoreStyle']): Promise<AudioBuffer> => {
-  const sampleRate = 24000;
+  const sampleRate = SAMPLE_RATE;
   const safeDuration = Math.max(1, duration);
   const ctx = new OfflineAudioContext(2, Math.floor(sampleRate * safeDuration), sampleRate);
 
@@ -627,7 +635,7 @@ export const stitchDialogueTracks = async (
   voiceBuffers: AudioBuffer[]
 ): Promise<AudioBuffer> => {
   const ctx = getAudioContext();
-  const MIX_RATE = 24000;
+  const MIX_RATE = SAMPLE_RATE;
 
   let totalDuration = 0;
   voiceBuffers.forEach(b => totalDuration += b.duration);
@@ -661,7 +669,7 @@ export const renderSFXTrack = async(
   segments: ParsedSegment[],
   voiceBuffers: AudioBuffer[]
 ): Promise<AudioBuffer> => {
-  const sampleRate = 24000;
+  const sampleRate = SAMPLE_RATE;
   const ctx = new OfflineAudioContext(1, Math.floor(sampleRate * totalDuration), sampleRate);
   
   let currentTime = 0;
@@ -707,7 +715,7 @@ export const generateTrackBuffers = async (
   ]);
 
   // Mix room tone and bg noise into one "Ambience" track for simplicity in the UI mixer
-  const sampleRate = 24000;
+  const sampleRate = SAMPLE_RATE;
   const ctx = new OfflineAudioContext(2, Math.floor(sampleRate * totalDuration), sampleRate);
   
   // Ambience Mix

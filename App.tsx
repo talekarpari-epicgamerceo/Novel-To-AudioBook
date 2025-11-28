@@ -14,7 +14,8 @@ import {
   CharacterProfile, 
   AVAILABLE_VOICES, 
   ProcessingState,
-  AudioTracks
+  AudioTracks,
+  ParsedSegment
 } from './types';
 import { 
   PlayIcon, 
@@ -36,6 +37,35 @@ const DEFAULT_TEXT = `The old house stood silent on the hill.
 Thunder rumbled overhead, shaking the ground beneath them.
 "Did you hear that?" Sarah asked, her voice trembling.
 The front door creaked open slowly, revealing the darkness inside.`;
+
+// Helper for concurrency
+const processWithConcurrency = async <T, R>(
+  items: T[],
+  concurrency: number,
+  task: (item: T, index: number) => Promise<R>
+): Promise<R[]> => {
+  const results: R[] = new Array(items.length);
+  const executing: Promise<void>[] = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const p = task(items[i], i).then((res) => {
+      results[i] = res;
+    });
+    executing.push(p);
+
+    const clean = () => {
+         const index = executing.indexOf(p);
+         if (index > -1) executing.splice(index, 1);
+    }
+    p.then(clean).catch(clean);
+
+    if (executing.length >= concurrency) {
+      await Promise.race(executing);
+    }
+  }
+  await Promise.all(executing);
+  return results;
+};
 
 export default function App() {
   const [text, setText] = useState<string>(DEFAULT_TEXT);
@@ -127,46 +157,52 @@ export default function App() {
     
     try {
       const updatedSegments = [...parsedData.segments];
-      const buffers: AudioBuffer[] = [];
+      
+      // Parallel processing with concurrency limit (e.g. 4)
+      const buffers: AudioBuffer[] = await processWithConcurrency(
+        updatedSegments, 
+        4, 
+        async (seg, index) => {
+          
+          // Fast-path for empty segments
+          if (!seg.text.trim()) {
+             const duration = Math.max(0.1, seg.text.length * 0.05);
+             return createSilenceBuffer(duration);
+          }
 
-      for (let i = 0; i < updatedSegments.length; i++) {
-        const seg = updatedSegments[i];
-        if (!seg.text.trim()) {
-           const duration = Math.max(0.1, seg.text.length * 0.05);
-           buffers.push(createSilenceBuffer(duration));
-           continue;
+          const profile = characterProfiles.find(p => p.name === seg.speaker);
+          const voiceId = profile?.voiceId || 'Puck'; 
+          
+          let context = "";
+          if (seg.isNarrator) {
+             context = "Narration. Read this in a clear, descriptive storytelling tone.";
+          } else {
+             context = `Character: ${seg.speaker} (${seg.gender}). 
+             Emotion/Tone: ${seg.emotion}. 
+             Pay close attention to any reporting verbs in the emotion instruction (e.g. whispered, shouted).`;
+          }
+
+          // Fetch Audio
+          const base64Audio = await generateSpeech(seg.text, voiceId, context);
+          const arrayBuffer = base64ToArrayBuffer(base64Audio);
+          let audioBuffer = await decodeAudioData(arrayBuffer);
+          
+          // Post-Processing
+          // Trim silence to prevent audio doubling/gapping
+          audioBuffer = trimSilence(audioBuffer);
+
+          // Apply Reverb to Dialogue only (to create space) - Reduced to 0.1 mix
+          if (!seg.isNarrator) {
+             audioBuffer = await applyReverb(audioBuffer, 0.1); 
+          }
+          
+          // Store result in segment object (mutation is safe inside async as long as we don't read concurrently)
+          updatedSegments[index].assignedVoiceId = voiceId;
+          updatedSegments[index].audioBuffer = audioBuffer;
+          
+          return audioBuffer;
         }
-
-        const profile = characterProfiles.find(p => p.name === seg.speaker);
-        const voiceId = profile?.voiceId || 'Puck'; 
-        
-        // Detailed context building for acting instruction
-        let context = "";
-        if (seg.isNarrator) {
-           context = "Narration. Read this in a clear, descriptive storytelling tone.";
-        } else {
-           // It's dialogue
-           context = `Character: ${seg.speaker} (${seg.gender}). 
-           Emotion/Tone: ${seg.emotion}. 
-           Pay close attention to any reporting verbs in the emotion instruction (e.g. whispered, shouted).`;
-        }
-
-        const base64Audio = await generateSpeech(seg.text, voiceId, context);
-        const arrayBuffer = base64ToArrayBuffer(base64Audio);
-        let audioBuffer = await decodeAudioData(arrayBuffer);
-        
-        // Trim silence to prevent audio doubling/gapping
-        audioBuffer = trimSilence(audioBuffer);
-
-        // Apply Reverb to Dialogue only (to create space) - Reduced to 0.1 mix
-        if (!seg.isNarrator) {
-           audioBuffer = await applyReverb(audioBuffer, 0.1); 
-        }
-        
-        updatedSegments[i].assignedVoiceId = voiceId;
-        updatedSegments[i].audioBuffer = audioBuffer;
-        buffers.push(audioBuffer);
-      }
+      );
 
       setStatus('mixing');
       
@@ -201,6 +237,12 @@ export default function App() {
   // Playback Control
   const togglePlayback = () => {
     const ctx = getAudioContext();
+    
+    // Crucial: Resume AudioContext on user gesture
+    if (ctx.state === 'suspended') {
+      ctx.resume();
+    }
+    
     audioContextRef.current = ctx;
     
     if (isPlaying) {
@@ -260,13 +302,16 @@ export default function App() {
       
       const offset = (pauseTimeRef.current % audioTracks.duration);
       
-      srcD.start(0, offset);
-      srcS.start(0, offset);
-      srcA.start(0, offset);
-      srcSFX.start(0, offset);
+      // Calculate correct start time relative to context
+      const now = ctx.currentTime;
+      startTimeRef.current = now - (offset / playbackSpeed);
+
+      srcD.start(now, offset);
+      srcS.start(now, offset);
+      srcA.start(now, offset);
+      srcSFX.start(now, offset);
       
       sourcesRef.current = { dialogue: srcD, score: srcS, ambience: srcA, sfx: srcSFX };
-      startTimeRef.current = ctx.currentTime - (offset / playbackSpeed);
       
       setIsPlaying(true);
 
