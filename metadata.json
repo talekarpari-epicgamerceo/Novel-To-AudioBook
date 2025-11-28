@@ -1,0 +1,7 @@
+{
+  "name": "AudioBook AI",
+  "description": "Transform text novels into immersive audiobooks with multi-character AI voices and dynamic scene ambience.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
