@@ -1,9 +1,14 @@
 import { GoogleGenAI, Type, Schema, Modality } from "@google/genai";
 import { AnalysisResult, ParsedSegment, SceneContext } from "../types";
+import { base64ToInt16, trimSilenceRaw } from './audioEngine';
 
 const API_KEY = process.env.API_KEY || '';
 
 const ai = new GoogleGenAI({ apiKey: API_KEY });
+
+// OPTIMIZATION: Cache Promises instead of values to deduplicate in-flight requests
+const ttsPromiseCache = new Map<string, Promise<Int16Array>>(); 
+const analysisCache = new Map<string, AnalysisResult>();
 
 // Schema definitions
 const segmentSchema: Schema = {
@@ -27,9 +32,16 @@ const sceneSchema: Schema = {
     mood: { type: Type.STRING },
     roomToneType: { type: Type.STRING, enum: ['quiet_room', 'nature', 'city', 'industrial', 'silence'] },
     bgNoiseType: { type: Type.STRING, enum: ['rain', 'wind', 'crowd', 'machinery', 'none'] },
-    scoreStyle: { type: Type.STRING, enum: ['happy', 'sad', 'tense', 'mysterious', 'romantic', 'neutral'] }
+    scoreStyle: { type: Type.STRING, enum: ['happy', 'sad', 'tense', 'mysterious', 'romantic', 'neutral'] },
+    narrativePerspective: { type: Type.STRING, enum: ['first_person', 'third_person'], description: "Is the story told from 'I' perspective (first_person) or 'He/She' perspective (third_person)?" },
+    protagonistName: { type: Type.STRING, description: "If first_person, who is the 'I'? If unknown, use 'Protagonist'. If third_person, leave null or empty." },
+    ambientSounds: { 
+      type: Type.ARRAY, 
+      items: { type: Type.STRING },
+      description: "List 3-5 specific background sounds that would be heard in this location to create an immersive atmosphere (e.g., 'distant traffic', 'birds chirping', 'fluorescent light hum', 'distant announcements', 'waves crashing')." 
+    }
   },
-  required: ["location", "mood", "roomToneType", "bgNoiseType", "scoreStyle"]
+  required: ["location", "mood", "roomToneType", "bgNoiseType", "scoreStyle", "narrativePerspective", "ambientSounds"]
 };
 
 const analysisSchema: Schema = {
@@ -44,46 +56,35 @@ const analysisSchema: Schema = {
   required: ["segments", "scene"]
 };
 
-// Helper to remove overlaps between segments to prevent "Said twice" errors
 const cleanSegments = (segments: ParsedSegment[]): ParsedSegment[] => {
   const cleaned = [...segments];
   for (let i = 0; i < cleaned.length - 1; i++) {
     const current = cleaned[i];
     const next = cleaned[i + 1];
     
-    // Check if next text starts with a suffix of current text
     const currText = current.text.trim();
     const nextText = next.text;
     
-    // Safety check: if current segment is just a quote mark or very short, ignore
     if (currText.length < 2) continue;
 
-    // Find overlapping string
-    // Case: Seg 1 "Hello," -> Seg 2 "Hello," said John
-    // We want to detect "Hello," in Seg 2 and remove it.
-    let overlapFound = false;
-    let checkLen = Math.min(currText.length, nextText.length);
-    
-    // Optimization: Check for exact prefix match first (most common hallucination)
     if (nextText.trim().startsWith(currText)) {
-       // Only strip if the original text doesn't explicitly repeat it.
-       // Since we don't have the raw full text map here easily, we assume strict segmentation.
-       // If Seg 1 is Dialogue and Seg 2 is Narrator, they should NOT overlap.
        if (current.isNarrator !== next.isNarrator) {
           const overlapIndex = nextText.indexOf(currText);
           if (overlapIndex !== -1) {
              cleaned[i+1].text = nextText.substring(overlapIndex + currText.length);
-             overlapFound = true;
           }
        }
     }
   }
-  
-  // Second pass: Ensure no empty segments after cleaning
   return cleaned.filter(s => s.text.trim().length > 0);
 };
 
 export const analyzeText = async (text: string): Promise<AnalysisResult> => {
+  const cacheKey = text.trim();
+  if (analysisCache.has(cacheKey)) {
+    return JSON.parse(JSON.stringify(analysisCache.get(cacheKey)));
+  }
+
   try {
     const prompt = `
       You are a meticulous audiobook script editor and director.
@@ -109,17 +110,22 @@ export const analyzeText = async (text: string): Promise<AnalysisResult> => {
          - If the text says ["Get out!" he screamed.], the emotion for "Get out!" MUST be "Screamed/Shouted loud".
          - If the text says ["Be quiet," she whispered.], the emotion for "Be quiet," MUST be "Whispered/Soft".
          - Capture the exact tone implied by the context.
+         - **Narrator Tone**: Also assign emotions to narration if the scene requires it (e.g. "Tense", "Fast-paced", "Melancholy").
 
       5. **SOUND EFFECTS (SFX FIELD)**:
          - Scan the narration text for specific sound events.
          - Examples: "The door creaked open" -> sfx: "creak/door". "Thunder rumbled overhead" -> sfx: "thunder". "He walked away" -> sfx: "footsteps". "Leaves rustled" -> sfx: "rustle". "The glass shattered" -> sfx: "shatter/crash".
+         - Look for micro-interactions: "sighed", "gasped", "shifted in chair", "clothes rustled".
          - Assign this keyword to the segment containing the description.
 
-      6. **CONTEXT**:
+      6. **CONTEXT & PERSPECTIVE**:
          - Analyze the scene location, mood, and soundscape requirements.
+         - **PERSPECTIVE**: Determine if the text is First Person ("I walked") or Third Person ("He walked").
+         - If First Person, identify the Protagonist's name if possible (e.g. from dialogue like "John, come here!").
+         - **AMBIENCE**: Think of the location described. List 3-5 specific sounds one would hear there to create a realistic, layered atmosphere.
 
       Analyze this text:
-      "${text.slice(0, 20000)}" 
+      "${text.slice(0, 25000)}" 
     `;
 
     const response = await ai.models.generateContent({
@@ -134,16 +140,13 @@ export const analyzeText = async (text: string): Promise<AnalysisResult> => {
 
     if (response.text) {
       const result = JSON.parse(response.text) as AnalysisResult;
-      
-      // Post-process to fix any hallucinations/duplicates
       result.segments = cleanSegments(result.segments);
-
-      // Add IDs for React keys
       result.segments = result.segments.map((s, i) => ({
         ...s,
         id: `seg_${Date.now()}_${i}`,
         originalText: s.text
       }));
+      analysisCache.set(cacheKey, result);
       return result;
     }
     throw new Error("No response from AI");
@@ -153,32 +156,46 @@ export const analyzeText = async (text: string): Promise<AnalysisResult> => {
   }
 };
 
-export const generateSpeech = async (text: string, voiceName: string, context: string): Promise<string> => {
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-preview-tts",
-      contents: `
-        Acting Instruction: ${context}
-        
-        Line to perform: "${text}"
-      `,
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: voiceName },
+export const generateSpeech = (text: string, voiceName: string, context: string): Promise<Int16Array> => {
+  const cacheKey = `${voiceName}:${context}:${text.trim()}`;
+  
+  // If a request is already in flight (or completed), return that promise.
+  // This deduplicates simultaneous requests (Pre-fetch vs Button Click).
+  if (ttsPromiseCache.has(cacheKey)) {
+     return ttsPromiseCache.get(cacheKey)!;
+  }
+
+  const task = (async () => {
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash-preview-tts",
+        contents: `Instr: ${context}\nText: "${text}"`,
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: voiceName },
+            },
           },
         },
-      },
-    });
+      });
 
-    const audioData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!audioData) {
-      throw new Error("No audio data returned");
+      const audioData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (!audioData) {
+        throw new Error("No audio data returned");
+      }
+
+      let rawAudio = base64ToInt16(audioData);
+      rawAudio = trimSilenceRaw(rawAudio);
+      return rawAudio;
+    } catch (error) {
+      console.error("TTS Error:", error);
+      // Remove failed promise from cache so it can be retried
+      ttsPromiseCache.delete(cacheKey);
+      throw error;
     }
-    return audioData;
-  } catch (error) {
-    console.error("TTS Error:", error);
-    throw error;
-  }
+  })();
+
+  ttsPromiseCache.set(cacheKey, task);
+  return task;
 };

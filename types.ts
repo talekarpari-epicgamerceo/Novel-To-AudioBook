@@ -1,3 +1,4 @@
+
 export interface ParsedSegment {
   id: string;
   text: string;
@@ -9,6 +10,7 @@ export interface ParsedSegment {
   sfx?: string; // New field for sound effects
   assignedVoiceId?: string;
   audioBuffer?: AudioBuffer;
+  speechDuration?: number; // Duration of speech before reverb/tails
 }
 
 export interface CharacterProfile {
@@ -24,6 +26,9 @@ export interface SceneContext {
   roomToneType: 'quiet_room' | 'nature' | 'city' | 'industrial' | 'silence';
   bgNoiseType: 'rain' | 'wind' | 'crowd' | 'machinery' | 'none';
   scoreStyle: 'happy' | 'sad' | 'tense' | 'mysterious' | 'romantic' | 'neutral';
+  narrativePerspective: 'first_person' | 'third_person';
+  protagonistName?: string;
+  ambientSounds: string[]; // List of specific sounds to generate
 }
 
 export interface AnalysisResult {
